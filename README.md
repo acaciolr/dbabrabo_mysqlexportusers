@@ -1,512 +1,296 @@
-## Summary
+<!--
+██████╗ ██████╗  █████╗     ██████╗ ██████╗  █████╗ ██████╗  ██████╗ 
+██╔══██╗██╔══██╗██╔══██╗    ██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔═══██╗
+██║  ██║██████╔╝███████║    ██████╔╝██████╔╝███████║██████╔╝██║   ██║
+██║  ██║██╔══██╗██╔══██║    ██╔══██╗██╔══██╗██╔══██║██╔══██╗██║   ██║
+██████╔╝██████╔╝██║  ██║    ██████╔╝██║  ██║██║  ██║██████╔╝╚██████╔╝
+╚═════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝ 
+  MySQL Shell Extension · v2.0
+-->
 
-MySQL Shell already provides powerful administrative utilities such as
-`util.dumpInstance()`, `util.copyInstance()`, and `util.checkForServerUpgrade()`.
-However, there is currently **no native way to export users, roles, and
-privileges** in an idempotent, version-control-friendly SQL format.
+# DBA BRABO
 
-This issue proposes adding a first-class utility — `util.exportUsers()` — and
-presents a working proof of concept (`brabo.py`) that already implements most
-of the required behavior as a community extension.
+> **MySQL Shell Extension** que exporta usuários, roles e privilégios em SQL
+> idempotente — sem dependências externas, pronto para Git, seguro para replay
+> entre ambientes (dev → staging → prod).
 
----
-
-## Problem
-
-DBAs migrating between environments today still rely on external tools:
-
-- **Percona Toolkit** (`pt-show-grants`) — requires installing packages outside
-  the Shell, Python 2/3 dependency headaches, no role support beyond basics.
-- **`mysqldump --all-databases`** — does **not** export users/grants cleanly;
-  output is not idempotent and cannot be replayed safely.
-- **`mysqlpump`** — deprecated and does not cover roles properly (8.0+).
-- **Manual scripts** — inconsistent, error-prone, rarely idempotent.
-
-There is no official Oracle-supported method to export security metadata in a
-form that can be:
-
-1. Replayed safely (`CREATE USER IF NOT EXISTS` semantics)
-2. Diffed and version-controlled (deterministic ordering)
-3. Migrated to HeatWave, InnoDB Cluster, or any managed MySQL service
+[![Version](https://img.shields.io/badge/version-2.0-blueviolet)](#changelog)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![MySQL Shell](https://img.shields.io/badge/MySQL%20Shell-8.0%2B-blue)](#compatibilidade)
+[![MySQL](https://img.shields.io/badge/MySQL-8.0%20%7C%209.4-orange)](#compatibilidade)
+[![Status](https://img.shields.io/badge/status-beta-orange)](#roadmap)
 
 ---
 
-## Proposal
+## Por que existe
 
-Add a new utility to the MySQL Shell `util` namespace:
+Migrar usuários, roles e grants entre ambientes sempre foi doloroso:
 
-```python
-# =====================================================================
-#                                                                     
-#     ██████╗ ██████╗  █████╗     ██████╗ ██████╗  █████╗ ██████╗  ██████╗ 
-#     ██╔══██╗██╔══██╗██╔══██╗    ██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔═══██╗
-#     ██║  ██║██████╔╝███████║    ██████╔╝██████╔╝███████║██████╔╝██║   ██║
-#     ██║  ██║██╔══██╗██╔══██║    ██╔══██╗██╔══██╗██╔══██║██╔══██╗██║   ██║
-#     ██████╔╝██████╔╝██║  ██║    ██████╔╝██║  ██║██║  ██║██████╔╝╚██████╔╝
-#     ╚═════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝                
-#                                                                     
-#     MySQL Shell Extension · Export users, roles & grants            
-#                                                                     
-# =====================================================================
-#  File     : brabo.py                                                
-#  Version  : 1.1                                                     
-#  Author   : Acacio LR                                               
-#  License  : MIT                                                     
-#  Repo     : https://github.com/<seu-usuario>/dba-brabo              
-#  Requires : MySQL Shell 8.0+ (Python mode)                          
-#  Tested   : MySQL 8.0.x · 9.4.0                                     
-# =====================================================================
-#
-#  DESCRIPTION
-#  -----------
-#  Extensão nativa para o MySQL Shell que exporta usuários, roles e
-#  privilégios em SQL idempotente, pronto para versionamento (Git) e
-#  replay seguro entre ambientes (dev → staging → prod).
-#
-#  INSTALLATION
-#  ------------
-#    mkdir -p ~/.mysqlsh/init.d
-#    cp brabo.py ~/.mysqlsh/init.d/brabo.py
-#    # reabra o MySQL Shell
-#
-#  QUICK START
-#  -----------
-#    brabo.help()                                        # ajuda inline
-#    brabo.export_grants()                               # tudo -> stdout
-#    brabo.export_grants(output="~/backup/grants.sql")   # tudo -> arquivo
-#    brabo.export_grants(user="app")                     # filtra usuário
-#    brabo.export_grants(host="%")                       # filtra host
-#    brabo.export_grants(include_alter=True)             # modo sync
-#    brabo.roles()                                       # lista roles
-#
-#  ROADMAP
-#  -------
-#    v1.1  export_grants, roles, help                       [current]
-#    v2.0  grants.diff, security.audit, replication.status
-#          innodb.cluster + official Shell extension API
-#
-# =====================================================================
+- **`mysqldump --all-databases`** — não exporta usuários/grants de forma limpa
+- **`mysqlpump`** — deprecado, não cobre roles direito (8.0+)
+- **Percona Toolkit** (`pt-show-grants`) — exige instalação externa ao Shell
+- **Scripts caseiros** — raramente idempotentes, difíceis de versionar
 
-from mysqlsh import globals
-import datetime
-import os
+O **DBA BRABO** resolve isso dentro do próprio MySQL Shell, em Python puro,
+com **zero dependências externas**.
 
-__version__ = "1.1"
-
-shell = globals.shell
-session = globals.session
-
-# Usuários internos que normalmente NÃO devem ser exportados
-SYSTEM_USERS = (
-    "mysql.sys",
-    "mysql.session",
-    "mysql.infoschema",
-)
-
-
-class Brabo(object):
-    """Exporta usuários, grants e roles do MySQL de forma segura."""
-
-    # -----------------------------------------------------------------
-    # Helpers internos
-    # -----------------------------------------------------------------
-    def _check_session(self):
-        if session is None:
-            print("[ERRO] Sessão não conectada.")
-            print("       Use \\connect usuario@host antes de rodar a extensão.")
-            return False
-        return True
-
-    @staticmethod
-    def _quote_account(user, host):
-        """Escapa user/host e devolve a string 'user'@'host' segura."""
-        u = str(user).replace("'", "''")
-        h = str(host).replace("'", "''")
-        return f"'{u}'@{h}'".replace("'@'", "'@'")  # mantém formato original
-
-    def _accounts(self, user=None, host=None, include_system=False):
-        sql = """
-        SELECT user, host
-          FROM mysql.user
-         WHERE 1=1
-        """
-        args = []
-
-        if user:
-            sql += " AND user = ?"
-            args.append(user)
-
-        if host:
-            sql += " AND host = ?"
-            args.append(host)
-
-        if not include_system:
-            placeholders = ",".join(["?"] * len(SYSTEM_USERS))
-            sql += f" AND user NOT IN ({placeholders})"
-            args.extend(SYSTEM_USERS)
-
-        sql += " ORDER BY user, host"
-
-        result = session.run_sql(sql, args)
-
-        return [(r[0], r[1]) for r in result.fetch_all()]
-
-    # -----------------------------------------------------------------
-    # Comandos públicos
-    # -----------------------------------------------------------------
-    def export_grants(
-        self,
-        user=None,
-        host=None,
-        output=None,
-        include_create=True,
-        include_alter=False,
-        include_grants=True,
-        include_system=False,
-    ):
-        """
-        Exporta CREATE USER / ALTER USER / GRANTs.
-
-        Parâmetros:
-          user            -> filtra por nome de usuário
-          host            -> filtra por host
-          output          -> caminho de arquivo (aceita ~)
-          include_create  -> emite CREATE USER IF NOT EXISTS (default True)
-          include_alter   -> emite ALTER USER (default False; use só p/ sync)
-          include_grants  -> emite GRANTs (default True)
-          include_system  -> inclui mysql.sys, mysql.session, etc (default False)
-        """
-        if not self._check_session():
-            return
-
-        accounts = self._accounts(user, host, include_system=include_system)
-
-        if not accounts:
-            print("Nenhum usuário encontrado com os filtros informados.")
-            return
-
-        server = session.run_sql("SELECT @@hostname").fetch_one()[0]
-        version = session.run_sql("SELECT @@version").fetch_one()[0]
-
-        lines = []
-        lines.append("-- =========================================================")
-        lines.append("-- DBA BRABO - MySQL Shell Extension")
-        lines.append(f"-- Version : {__version__}")
-        lines.append(f"-- Server  : {server}")
-        lines.append(f"-- Version : {version}")
-        lines.append(f"-- Date    : {datetime.datetime.now()}")
-        lines.append("-- =========================================================")
-        lines.append("")
-
-        for usr, hst in accounts:
-            account = self._quote_account(usr, hst)
-
-            lines.append("-- ---------------------------------------------------------")
-            lines.append(f"-- USER {account}")
-            lines.append("-- ---------------------------------------------------------")
-
-            # CREATE USER
-            if include_create:
-                try:
-                    row = session.run_sql(
-                        f"SHOW CREATE USER {account}"
-                    ).fetch_one()
-                    stmt = row[0]
-                    if stmt.upper().startswith("CREATE USER"):
-                        stmt = stmt.replace(
-                            "CREATE USER",
-                            "CREATE USER IF NOT EXISTS",
-                            1,
-                        )
-                    lines.append(stmt + ";")
-                except Exception as e:
-                    lines.append(f"-- [WARN] CREATE USER falhou para {account}: {e}")
-
-            # ALTER USER (opcional, para sincronização)
-            if include_alter:
-                try:
-                    alter = session.run_sql(
-                        f"SHOW CREATE USER {account}"
-                    ).fetch_one()[0]
-                    if alter.upper().startswith("CREATE USER"):
-                        alter = "ALTER USER" + alter[len("CREATE USER"):]
-                    lines.append(alter + ";")
-                except Exception as e:
-                    lines.append(f"-- [WARN] ALTER USER falhou para {account}: {e}")
-
-            # GRANTs
-            if include_grants:
-                try:
-                    grants = session.run_sql(f"SHOW GRANTS FOR {account}")
-                    for g in grants.fetch_all():
-                        lines.append(g[0] + ";")
-                except Exception as e:
-                    lines.append(f"-- [WARN] SHOW GRANTS falhou para {account}: {e}")
-
-            lines.append("")
-
-        text = "\n".join(lines)
-
-        if output:
-            path = os.path.expanduser(output)
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-
-            with open(path, "w", encoding="utf8") as f:
-                f.write(text)
-
-            print(f"[OK]   {len(accounts)} usuário(s) exportado(s)")
-            print(f"[FILE] {path}")
-        else:
-            print(text)
-
-    def roles(self, show_grants=True):
-        """
-        Lista roles existentes (is_role='Y').
-        Se show_grants=True, mostra também os privilégios de cada role.
-        """
-        if not self._check_session():
-            return
-
-        sql = """
-        SELECT user, host
-          FROM mysql.user
-         WHERE is_role = 'Y'
-         ORDER BY user, host
-        """
-        rows = session.run_sql(sql).fetch_all()
-
-        if not rows:
-            print("\nNenhuma role encontrada.\n")
-            return
-
-        print("\nRoles\n")
-        for usr, hst in rows:
-            account = self._quote_account(usr, hst)
-            print(f"  {usr}@{hst}")
-
-            if show_grants:
-                try:
-                    grants = session.run_sql(f"SHOW GRANTS FOR {account}")
-                    for g in grants.fetch_all():
-                        print(f"      {g[0]}")
-                except Exception as e:
-                    print(f"      [WARN] {e}")
-
-        print()
-
-    def help(self):
-        print("""
-DBA BRABO Extension v{}
-
-Comandos
---------
-brabo.help()
-    Mostra esta ajuda.
-
-brabo.export_grants(...)
-    Exporta CREATE USER, ALTER USER e GRANTs.
-
-    Parâmetros:
-      user            = "app"          filtra por usuário
-      host            = "%"            filtra por host
-      output          = "~/grants.sql" grava em arquivo
-      include_create  = True           emite CREATE USER IF NOT EXISTS
-      include_alter   = False          emite ALTER USER (sync)
-      include_grants  = True           emite GRANTs
-      include_system  = False          inclui mysql.sys, mysql.session, ...
-
-    Exemplos:
-      brabo.export_grants()
-      brabo.export_grants(user="app")
-      brabo.export_grants(host="%")
-      brabo.export_grants(output="~/backup/grants.sql")
-      brabo.export_grants(include_alter=True, output="~/sync.sql")
-
-brabo.roles()
-    Lista roles e seus privilégios.
-
-Roadmap (v2)
-------------
-brabo.grants.diff()
-brabo.security.audit()
-brabo.replication.status()
-brabo.innodb.cluster()
-""".format(__version__))
-
-
-# ---------------------------------------------------------------------
-# Registro global
-# ---------------------------------------------------------------------
-brabo = Brabo()
-globals.brabo = brabo
-
-print(f"DBA BRABO extension v{__version__} loaded.")
-```
-
-```python
-util.exportUsers()
-```
-
-### Examples
-
-```python
-util.exportUsers(output="/tmp/users.sql")
-util.exportUsers(user="app")
-util.exportUsers(host="%")
-util.exportUsers(includeRoles=True)
-util.exportUsers(includeSystem=False)
-```
-
-### Suggested API
-
-```python
-util.exportUsers(
-    output          = None,      # path or None for stdout
-    user            = None,      # filter by user
-    host            = None,      # filter by host
-    include_create  = True,      # emit CREATE USER IF NOT EXISTS
-    include_alter   = False,     # emit ALTER USER (sync mode)
-    include_grants  = True,      # emit GRANTs
-    include_roles   = True,      # include roles and default roles
-    include_system  = False,     # include mysql.sys, mysql.session, ...
-    deterministic   = True,      # stable ordering for Git
-)
-```
-
-### Expected output
-
-- `CREATE USER IF NOT EXISTS`
-- Authentication plugin and password hash
-- `ALTER USER` attributes (SSL requirements, password policy, resource limits)
-- Roles and default roles
-- All `GRANT` statements
-- Deterministic ordering for Git version control
-- Header with server, version, and timestamp
-
-### Benefits
-
-- Removes dependency on Percona Toolkit and similar external tools
-- Simplifies migrations to HeatWave and InnoDB Cluster
-- Provides an official Oracle-supported method for exporting security metadata
-- Consistent with existing `util.*` administrative functions
-- Safe to replay: idempotent output suitable for CI/CD pipelines
+A partir da **v2.0**, a extensão também gera um **Security Metadata Dump**
+estruturalmente compatível com `util.dumpInstance()`, reaproveitando o
+manifesto `@.json` quando o diretório já contém um dump do Shell.
 
 ---
 
-## Proof of Concept — DBA BRABO extension
-
-To validate the idea before proposing an official implementation, I built a
-community extension called **DBA BRABO** (`brabo.py`) that runs inside MySQL
-Shell via `~/.mysqlsh/init.d/`. It has no external dependencies.
-
-### Installation
+## Instalação
 
 ```bash
 mkdir -p ~/.mysqlsh/init.d
 cp brabo.py ~/.mysqlsh/init.d/brabo.py
-# reopen MySQL Shell
+# reabra o MySQL Shell
 ```
 
-### Available commands (v1.1)
+Ao abrir o Shell você verá:
 
-| Command | Description |
+```
+DBA BRABO extension v2.0 loaded. Type brabo.help() for usage.
+```
+
+---
+
+## Quick Start
+
+### v1.1 — Export em arquivo SQL único (legado, ainda suportado)
+
+```python
+brabo.export_grants()                                       # stdout
+brabo.export_grants(output="~/backup/grants.sql")           # arquivo
+brabo.export_grants(user="app")                             # filtra user
+brabo.export_grants(host="%")                               # filtra host
+brabo.export_grants(include_alter=True, output="~/sync.sql")# modo sync
+brabo.roles()                                               # lista roles
+```
+
+### v2.0 — Security Metadata Dump (compatível com `util.dumpInstance`)
+
+```python
+# Gera um dump completo de segurança
+brabo.dumpSecurityMetadata(output="/backup/prod")
+
+# Gera só uma parte
+brabo.dumpUsers("/backup/prod")
+brabo.dumpRoles("/backup/prod")
+brabo.dumpGrants("/backup/prod")
+brabo.dumpSecurity("/backup/prod")
+
+# Inclui contas de sistema (mysql.sys, mysql.session, mysql.infoschema)
+brabo.dumpSecurityMetadata(output="/backup/prod", include_system=True)
+
+# Ajuda inline
+brabo.help()
+```
+
+---
+
+## Comandos
+
+### v1.1 — Export legado (arquivo único)
+
+| Comando | Descrição |
 |---|---|
-| `brabo.help()` | Inline help |
-| `brabo.export_grants()` | Export `CREATE USER` + `GRANT`s |
-| `brabo.export_grants(user="app")` | Filter by user |
-| `brabo.export_grants(host="%")` | Filter by host |
-| `brabo.export_grants(output="~/grants.sql")` | Write to file |
-| `brabo.export_grants(include_alter=True)` | Sync mode |
-| `brabo.roles()` | List roles and their privileges |
+| `brabo.help()` | Ajuda inline completa |
+| `brabo.export_grants()` | Exporta `CREATE USER` + `ALTER USER` + `GRANT`s |
+| `brabo.export_grants(user="app")` | Filtra por usuário |
+| `brabo.export_grants(host="%")` | Filtra por host |
+| `brabo.export_grants(output="~/grants.sql")` | Grava em arquivo |
+| `brabo.export_grants(include_alter=True)` | Modo sincronização |
+| `brabo.roles()` | Lista roles e seus privilégios |
 
-### Sample output
+**Parâmetros de `export_grants()`**
+
+| Parâmetro | Default | Descrição |
+|---|---|---|
+| `user` | `None` | Filtra por usuário |
+| `host` | `None` | Filtra por host |
+| `output` | `None` | Caminho do arquivo (aceita `~`) |
+| `include_create` | `True` | Emite `CREATE USER IF NOT EXISTS` |
+| `include_alter` | `False` | Emite `ALTER USER` (modo sync) |
+| `include_grants` | `True` | Emite `GRANT`s |
+| `include_system` | `False` | Inclui `mysql.sys`, `mysql.session`, ... |
+
+### v2.0 — Security Metadata Dump
+
+| Comando | Descrição |
+|---|---|
+| `brabo.dumpSecurityMetadata(output, ...)` | Gera dump completo (todos os arquivos + manifesto) |
+| `brabo.dumpUsers(output, include_system=False)` | Gera apenas `@.users.sql` |
+| `brabo.dumpRoles(output)` | Gera apenas `@.roles.sql` |
+| `brabo.dumpGrants(output, include_system=False)` | Gera apenas `@.grants.sql` |
+| `brabo.dumpSecurity(output, include_system=False)` | Gera apenas `@.security.json` |
+
+**Parâmetros de `dumpSecurityMetadata()`**
+
+| Parâmetro | Default | Descrição |
+|---|---|---|
+| `output` | — | Diretório destino (obrigatório) |
+| `include_system` | `False` | Inclui contas internas |
+| `include_users` | `True` | Gera `@.users.sql` |
+| `include_roles` | `True` | Gera `@.roles.sql` |
+| `include_grants` | `True` | Gera `@.grants.sql` |
+| `include_inventory` | `True` | Gera `@.security.json` |
+
+---
+
+## Estrutura do Security Metadata Dump
+
+Compatível com o layout gerado por `util.dumpInstance()`:
+
+```
+/backup/prod/
+├── @.json              ← manifesto (lido/atualizado, nunca sobrescrito)
+├── @.users.sql         ← CREATE USER + ALTER USER (idempotente)
+├── @.roles.sql         ← CREATE ROLE + grants de role
+├── @.grants.sql        ← GRANTs por conta
+└── @.security.json     ← inventário (contadores + plugins + flags)
+```
+
+### Regras do manifesto `@.json`
+
+Quando o diretório já contém um `@.json` gerado por `util.dumpInstance()`,
+a extensão:
+
+1. **Lê** o manifesto existente
+2. **Reaproveita** `origin`, `serverVersion`, `gtidExecuted`, `charset`,
+   `creationTime`
+3. **Apenas adiciona** chaves próprias (`securityMetadata`,
+   `securityMetadataVersion`, `securityLastUpdate`)
+4. **Nunca toca** em `schemas`, `users`, `snapshot` ou qualquer chave do Shell
+
+---
+
+## Integração com `util.dumpInstance()`
+
+```python
+# 1. Faz o dump normal do Shell
+util.dumpInstance("/backup/prod")
+
+# 2. Complementa com o dump de segurança
+brabo.dumpSecurityMetadata(output="/backup/prod")
+
+# 3. Valida que o Shell ainda lê o dump sem erros
+util.loadDump("/backup/prod", dryRun=True)
+```
+
+Se o passo 3 rodar sem reclamação do `@.json`, a integração está correta.
+
+---
+
+## Exemplo de saída
+
+### `@.users.sql`
 
 ```sql
--- =========================================================
--- DBA BRABO - MySQL Shell Extension
--- Version : 1.1
--- Server  : mysql-prod-01
--- Version : 9.4.0
--- Date    : 2026-09-27 14:03:22
--- =========================================================
+-- DBA BRABO · users dump
+-- Generated: 2026-09-28 10:00:00
+-- Users    : 3
 
--- ---------------------------------------------------------
 -- USER 'app'@'%'
--- ---------------------------------------------------------
 CREATE USER IF NOT EXISTS 'app'@'%'
 IDENTIFIED WITH caching_sha2_password
 AS '$A$005$HASH';
+ALTER USER 'app'@'%'
+IDENTIFIED WITH caching_sha2_password
+AS '$A$005$HASH';
+```
 
+### `@.grants.sql`
+
+```sql
+-- GRANTS 'app'@'%'
 GRANT SELECT, INSERT ON ERP.* TO 'app'@'%';
 GRANT EXECUTE ON PROCEDURE ERP.sp_vendas TO 'app'@'%';
 ```
 
-### Security considerations
+### `@.security.json`
 
-- Queries are parameterized via `session.run_sql(sql, args)` where possible
-- Explicit escaping of `user`/`host` when assembling `'user'@'host'`
-  (required because `SHOW CREATE USER` and `SHOW GRANTS` do not accept
-  placeholders across all versions)
-- The extension is **read-only** — it never writes to the server
-- System users (`mysql.sys`, `mysql.session`, `mysql.infoschema`) are
-  excluded by default
-
-### Compatibility tested
-
-- MySQL 8.0.x — OK
-- MySQL 9.4.0 — OK
-- MySQL 5.7 — pending (`SHOW CREATE USER` exists since 5.7.6)
-- MariaDB — not supported (different `mysql.user` schema)
-
----
-
-## Roadmap (V2 of the community extension)
-
-- [ ] `brabo.grants.diff(user_a, user_b)` — compare privileges
-- [ ] `brabo.security.audit()` — users without password, without expiration,
-      with `%` host, inactive accounts
-- [ ] `brabo.replication.status()`
-- [ ] `brabo.innodb.cluster()`
-- [ ] Migrate to the **official extension API**
-      (`shell.register_extension(...)`) to reach the same level of polish as
-      `util.checkForServerUpgrade()`
-- [ ] Treat roles as first-class citizens in the export
+```json
+{
+  "users": 148,
+  "roles": 12,
+  "accounts_locked": 3,
+  "ssl_required": 98,
+  "plugins": {
+    "caching_sha2_password": 140,
+    "mysql_native_password": 8
+  },
+  "generated_at": "2026-09-28T10:00:00",
+  "generator": "dba-brabo v2.0"
+}
+```
 
 ---
 
-## Open questions
+## Segurança
 
-1. Should `include_alter` default to `False` (pure restore) or `True`
-   (overwrite)? The community extension currently defaults to `False`.
-2. Is there interest in splitting the API into namespaces
-   (`util.users.export()`, `util.roles.export()`) or keep a single entry point?
-3. Should the export include `PROXY` grants, dynamic privileges, and
-   password history? These are often missed by community tools.
-4. Would Oracle accept a contribution of a prototype as a starting point for
-   the official implementation?
-
----
-
-## Checklist
-
-- [x] No external dependencies
-- [x] Handles "session not connected" gracefully
-- [x] Escapes `user`/`host` safely
-- [x] Filters system users by default
-- [x] Inline documentation (`brabo.help()`)
-- [x] Deterministic ordering
-- [ ] Automated tests
-- [ ] Packaging (`pip` or Shell extension format)
+- ✅ Queries parametrizadas via `session.run_sql(sql, args)`
+- ✅ Escaping explícito de `user`/`host` ao montar `'user'@'host'`
+- ✅ **Read-only** — a extensão nunca escreve no servidor
+- ✅ Usuários de sistema excluídos por padrão
+- ✅ Manifesto `@.json` existente é preservado (chaves do Shell nunca
+  são sobrescritas)
+- ✅ Nenhuma credencial é logada ou gravada
 
 ---
 
-## References
+## Compatibilidade
 
-- [MySQL Shell utilities](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-utilities.html)
+| Versão | Status |
+|---|---|
+| MySQL 8.0.x | ✅ Testado |
+| MySQL 9.4.0 | ✅ Testado |
+| MySQL 5.7 | ⏳ Pendente (`SHOW CREATE USER` existe desde 5.7.6) |
+| MariaDB | ❌ Não suportado (schema de `mysql.user` diferente) |
+
+**Requisitos:** MySQL Shell 8.0+ em modo Python.
+
+---
+
+## Roadmap
+
+| Versão | Escopo |
+|---|---|
+| **v1.1** | `export_grants()`, `roles()`, `help()`, escaping seguro |
+| **v2.0** *(atual)* | `dumpSecurityMetadata()`, manifesto `@.json`, integração com `util.dumpInstance()`, inventário JSON |
+| **v2.1** | `brabo.grants.diff()`, `brabo.security.audit()` |
+| **v3.0** | Migração para a API oficial de extensões do Shell (`shell.register_extension()`) |
+| **RFC** | Proposta upstream de `util.dumpInstance(users=True, roles=True, grants=True)` e `util.loadDump(loadUsers=True)` |
+
+---
+
+## Contribuindo
+
+Veja [CONTRIBUTING.md](CONTRIBUTING.md). PRs são bem-vindos, especialmente
+testes em MySQL 5.7 e MariaDB.
+
+Áreas que precisam de ajuda:
+
+- Testes em **MySQL 5.7**
+- Testes em **MariaDB** (para eventual suporte)
+- Testes automatizados (pytest + mock da sessão do Shell)
+- Migração para a API oficial de extensões
+- Validação do formato `@.json` em diferentes versões do MySQL Shell
+
+---
+
+## Licença
+
+[MIT](LICENSE) © Acacio LR
+
+---
+
+## Referências
+
+- [MySQL Shell Utilities](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-utilities.html)
+- [`util.dumpInstance()`](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-utilities-dump-instance-schema.html)
+- [`util.loadDump()`](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-utilities-load-dump.html)
 - [`util.checkForServerUpgrade()`](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-utilities-upgrade.html)
+- [MySQL Shell Extension API](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-extensions.html)
 - [Percona Toolkit `pt-show-grants`](https://www.percona.com/doc/percona-toolkit/LATEST/pt-show-grants.html)
-- [MySQL Shell extension API](https://dev.mysql.com/doc/mysql-shell/en/mysql-shell-extensions.html)
-
-[mysql_brabo_mysqlsh_exportUser.py](https://github.com/user-attachments/files/32709088/mysql_brabo_mysqlsh_exportUser.py)
