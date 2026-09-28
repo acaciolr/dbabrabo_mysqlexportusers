@@ -453,10 +453,16 @@ Veja [CONTRIBUTING.md](CONTRIBUTING.md). PRs são bem-vindos, especialmente:
 
 ```python
 # =====================================================================
-#
-#     DBA BRABO - MySQL Shell Extension
-#     Export users, roles and grants (GRANT, REVOKE, MariaDB->MySQL)
-#
+#                                                                     
+#     ██████╗ ██████╗  █████╗     ██████╗ ██████╗  █████╗ ██████╗  ██████╗ 
+#     ██╔══██╗██╔══██╗██╔══██╗    ██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔═══██╗
+#     ██║  ██║██████╔╝███████║    ██████╔╝██████╔╝███████║██████╔╝██║   ██║
+#     ██║  ██║██╔══██╗██╔══██║    ██╔══██╗██╔══██╗██╔══██║██╔══██╗██║   ██║
+#     ██████╔╝██████╔╝██║  ██║    ██████╔╝██║  ██║██║  ██║██████╔╝╚██████╔╝
+#     ╚═════╝ ╚═════╝ ╚═╝  ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝ 
+#                                                                     
+#     MySQL Shell Extension · Export users, roles & grants            
+#                                                                     
 # =====================================================================
 #  File     : brabo.py
 #  Version  : 2.2
@@ -464,20 +470,78 @@ Veja [CONTRIBUTING.md](CONTRIBUTING.md). PRs são bem-vindos, especialmente:
 #  License  : MIT
 #  Repo     : https://github.com/<seu-usuario>/dba-brabo
 #  Requires : MySQL Shell 8.0+ (Python mode)
-#  Tested   : MySQL 8.0.x / 8.4.x / 9.4.0
+#  Tested   : MySQL 8.0.x · 8.4.x · 9.4.0
 # =====================================================================
 #
+#  DESCRIPTION
+#  -----------
+#  Extensão nativa para o MySQL Shell que exporta usuários, roles e
+#  privilégios em SQL idempotente, pronto para versionamento (Git) e
+#  replay seguro entre ambientes (dev → staging → prod).
+#
+#  A partir da v2.0, a extensão também gera um Security Metadata Dump
+#  estruturalmente compatível com util.dumpInstance(), reaproveitando
+#  o manifesto @.json existente quando o diretório já contém um dump
+#  do Shell.
+#
+#  A partir da v2.1, suporta modo REVOKE — gera os comandos de revogação
+#  a partir dos grants existentes, útil para rollback e auditoria.
+#
+#  A partir da v2.2, converte sintaxe proprietária do MariaDB para MySQL
+#  válido (IDENTIFIED VIA → IDENTIFIED WITH, unix_socket/ed25519 removidos,
+#  PASSWORD() convertido), equivalente ao --convert-MariaDB do pt-show-grants.
+#
 #  INSTALLATION
+#  ------------
 #    mkdir -p ~/.mysqlsh/init.d
 #    cp brabo.py ~/.mysqlsh/init.d/brabo.py
 #    # reabra o MySQL Shell
 #
 #  LOAD IN SHELL
+#  ------------
 #    \py
 #    import sys
 #    sys.path.insert(0, "/root/.mysqlsh/init.d")
 #    from brabo import brabo
 #    brabo.help()
+#
+#  QUICK START
+#  -----------
+#    brabo.help()                                        # ajuda inline
+#
+#    # --- v1.1 (arquivo SQL único) ---
+#    brabo.export_grants()                               # tudo -> stdout
+#    brabo.export_grants(output="~/backup/grants.sql")   # tudo -> arquivo
+#    brabo.export_grants(user="app")                     # filtra usuário
+#    brabo.export_grants(host="%")                       # filtra host
+#    brabo.export_grants(include_alter=True)             # modo sync
+#    brabo.roles()                                       # lista roles
+#
+#    # --- v2.1 (modo REVOKE) ---
+#    brabo.export_revokes()                              # REVOKE de tudo
+#    brabo.export_revokes(user="app")                    # REVOKE de um user
+#    brabo.export_grants(mode="revoke")                  # idem, via mode=
+#
+#    # --- v2.2 (conversão MariaDB -> MySQL) ---
+#    brabo.export_grants(convert_mariadb=True)           # converte tudo
+#    brabo.export_grants(output="~/mysql.sql", convert_mariadb=True)
+#    brabo.export_revokes(convert_mariadb=True)
+#
+#    # --- v2.0 (Security Metadata Dump) ---
+#    brabo.dumpSecurityMetadata(output="/backup/prod")   # dump completo
+#    brabo.dumpUsers("/backup/prod")                     # só users
+#    brabo.dumpRoles("/backup/prod")                     # só roles
+#    brabo.dumpGrants("/backup/prod")                    # só grants
+#    brabo.dumpSecurity("/backup/prod")                  # só inventário
+#
+#  ROADMAP
+#  -------
+#    v1.1  export_grants, roles, help
+#    v2.0  dumpSecurityMetadata + integração com util.dumpInstance()
+#    v2.1  export_revokes + mode="revoke"
+#    v2.2  convert_mariadb + filtro mariadb.sys/mariadb.session  [current]
+#    v2.3  grants.diff, security.audit, ordenação determinística
+#    v3.0  official Shell extension API (shell.register_extension)
 #
 # =====================================================================
 
@@ -596,39 +660,46 @@ class Brabo(object):
 
         s = stmt
 
+        # 1. IDENTIFIED VIA <plugin> USING PASSWORD('...')
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+PASSWORD\('([^']*)'\)",
             r"IDENTIFIED WITH \1 BY '\2'",
             s, flags=re.IGNORECASE,
         )
 
+        # 2. IDENTIFIED VIA <plugin> USING <resto>
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+",
             r"IDENTIFIED WITH \1 AS ",
             s, flags=re.IGNORECASE,
         )
 
+        # 3. IDENTIFIED VIA <plugin> AS <resto>
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+AS\s+",
             r"IDENTIFIED WITH \1 AS ",
             s, flags=re.IGNORECASE,
         )
 
+        # 4. Remove OR <plugin_inexistente_no_mysql>
         s = re.sub(
             r"\s+OR\s+(unix_socket|ed25519|auth_pam|mysql_old_password|pam)\b",
             "", s, flags=re.IGNORECASE,
         )
 
+        # 5. GRANT ... IDENTIFIED BY PASSWORD '...' (MariaDB permite, MySQL 8 nao)
         s = re.sub(
             r"\s+IDENTIFIED\s+BY\s+PASSWORD\s+'[^']*'",
             "", s, flags=re.IGNORECASE,
         )
 
+        # 6. GRANT ... IDENTIFIED BY '...' (idem)
         s = re.sub(
             r"\s+IDENTIFIED\s+BY\s+'[^']*'",
             "", s, flags=re.IGNORECASE,
         )
 
+        # 7. Remove clausulas MySQL-only (por seguranca, se vierem do dump)
         s = re.sub(
             r"\s+PASSWORD\s+HISTORY\s+\S+",
             "", s, flags=re.IGNORECASE,
@@ -656,6 +727,8 @@ class Brabo(object):
           - GRANT X ON obj TO user  -> REVOKE X ON obj FROM user
           - GRANT 'role' TO user    -> REVOKE 'role' FROM user
           - GRANT PROXY ON x TO y   -> REVOKE PROXY ON x FROM y
+
+        Devolve lista de strings (0, 1 ou 2 statements).
         """
         g = grant.strip().rstrip(";").strip()
         if not g:
@@ -1237,7 +1310,7 @@ brabo.grants.diff()
 brabo.security.audit()
 brabo.replication.status()
 brabo.innodb.cluster()
-Ordenacao deterministica de GRANTs para Git
+Ordenacao determinística de GRANTs para Git
 Migracao para a API oficial de extensoes do Shell
 """.format(__version__))
 
