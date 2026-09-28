@@ -74,7 +74,6 @@ __version__ = "2.0"
 shell = globals.shell
 session = globals.session
 
-# Usuários internos que normalmente NÃO devem ser exportados
 SYSTEM_USERS = (
     "mysql.sys",
     "mysql.session",
@@ -83,15 +82,15 @@ SYSTEM_USERS = (
 
 
 class Brabo(object):
-    """DBA BRABO — exportação e dump de metadados de segurança."""
+    """DBA BRABO - export e dump de metadados de seguranca."""
 
     # -----------------------------------------------------------------
     # Helpers internos
     # -----------------------------------------------------------------
     def _check_session(self):
         if session is None:
-            print("[ERRO] Sessão não conectada.")
-            print("       Use \\connect usuario@host antes de rodar a extensão.")
+            print("[ERRO] Sessao nao conectada.")
+            print("       Use \\connect usuario@host antes de rodar a extensao.")
             return False
         return True
 
@@ -103,13 +102,19 @@ class Brabo(object):
         return "'{}'@'{}'".format(u, h)
 
     def _accounts(self, user=None, host=None, include_system=False, is_role=None):
-        """
-        Lista contas em mysql.user.
+        """Lista contas em mysql.user.
 
-        is_role=None  -> todos (users + roles)  [comportamento v1.1]
-        is_role=False -> apenas usuários
+        is_role=None  -> todos (users + roles)
+        is_role=False -> apenas usuarios
         is_role=True  -> apenas roles
         """
+        # Deteccao de role no MySQL 8.0+:
+        #   role = account_locked='Y' AND password_expired='Y' AND authentication_string=''
+        role_condition = (
+            "account_locked = 'Y' AND password_expired = 'Y' "
+            "AND authentication_string = ''"
+        )
+
         sql = "SELECT user, host FROM mysql.user WHERE 1=1"
         args = []
 
@@ -121,9 +126,10 @@ class Brabo(object):
             sql += " AND host = ?"
             args.append(host)
 
-        if is_role is not None:
-            sql += " AND is_role = ?"
-            args.append("Y" if is_role else "N")
+        if is_role is True:
+            sql += " AND ({})".format(role_condition)
+        elif is_role is False:
+            sql += " AND NOT ({})".format(role_condition)
 
         if not include_system:
             placeholders = ",".join(["?"] * len(SYSTEM_USERS))
@@ -147,13 +153,14 @@ class Brabo(object):
 
     def _user_grants(self, user, host):
         acc = self._quote_account(user, host)
-        return [r[0] for r in session.run_sql("SHOW GRANTS FOR {}".format(acc)).fetch_all()]
+        sql = "SHOW GRANTS FOR {}".format(acc)
+        return [r[0] for r in session.run_sql(sql).fetch_all()]
 
     # -----------------------------------------------------------------
-    # Manifesto @.json — compatível com util.dumpInstance()
+    # Manifesto @.json - compativel com util.dumpInstance()
     # -----------------------------------------------------------------
     def _read_manifest(self, dump_dir):
-        """Lê @.json existente. Devolve dict ou None."""
+        """Le @.json existente. Devolve dict ou None."""
         path = os.path.join(os.path.expanduser(dump_dir), "@.json")
         if not os.path.isfile(path):
             return None
@@ -210,7 +217,7 @@ class Brabo(object):
         return path
 
     # -----------------------------------------------------------------
-    # Inventário JSON
+    # Inventario JSON
     # -----------------------------------------------------------------
     def _build_security_inventory(self, users, roles):
         plugins = {}
@@ -245,7 +252,7 @@ class Brabo(object):
         }
 
     # =================================================================
-    # v1.1 — comandos legados (mantidos por retrocompatibilidade)
+    # v1.1 - comandos legados
     # =================================================================
     def export_grants(
         self,
@@ -257,14 +264,14 @@ class Brabo(object):
         include_grants=True,
         include_system=False,
     ):
-        """Exporta CREATE USER / ALTER USER / GRANTs em arquivo único."""
+        """Exporta CREATE USER / ALTER USER / GRANTs em arquivo unico."""
         if not self._check_session():
             return
 
         accounts = self._accounts(user, host, include_system=include_system)
 
         if not accounts:
-            print("Nenhum usuário encontrado com os filtros informados.")
+            print("Nenhum usuario encontrado com os filtros informados.")
             return
 
         server = session.run_sql("SELECT @@hostname").fetch_one()[0]
@@ -319,13 +326,13 @@ class Brabo(object):
                 os.makedirs(parent, exist_ok=True)
             with open(path, "w", encoding="utf8") as f:
                 f.write(text)
-            print("[OK]   {} usuário(s) exportado(s)".format(len(accounts)))
+            print("[OK]   {} usuario(s) exportado(s)".format(len(accounts)))
             print("[FILE] {}".format(path))
         else:
             print(text)
 
     def roles(self, show_grants=True):
-        """Lista roles existentes e, opcionalmente, seus privilégios."""
+        """Lista roles existentes e, opcionalmente, seus privilegios."""
         if not self._check_session():
             return
 
@@ -347,7 +354,7 @@ class Brabo(object):
         print()
 
     # =================================================================
-    # v2.0 — Security Metadata Dump (compatível com util.dumpInstance)
+    # v2.0 - Security Metadata Dump
     # =================================================================
     def dumpUsers(self, output, include_system=False):
         """Gera <output>/@.users.sql (CREATE + ALTER USER idempotentes)."""
@@ -359,7 +366,7 @@ class Brabo(object):
         users = self._accounts(include_system=include_system, is_role=False)
 
         lines = [
-            "-- DBA BRABO · users dump",
+            "-- DBA BRABO - users dump",
             "-- Generated: {}".format(datetime.datetime.now()),
             "-- Users    : {}".format(len(users)),
             "",
@@ -391,7 +398,7 @@ class Brabo(object):
         roles = self._accounts(is_role=True)
 
         lines = [
-            "-- DBA BRABO · roles dump",
+            "-- DBA BRABO - roles dump",
             "-- Generated: {}".format(datetime.datetime.now()),
             "-- Roles    : {}".format(len(roles)),
             "",
@@ -422,7 +429,7 @@ class Brabo(object):
         users = self._accounts(include_system=include_system, is_role=False)
 
         lines = [
-            "-- DBA BRABO · grants dump",
+            "-- DBA BRABO - grants dump",
             "-- Generated: {}".format(datetime.datetime.now()),
             "-- Accounts : {}".format(len(users)),
             "",
@@ -444,7 +451,7 @@ class Brabo(object):
         return path, len(users)
 
     def dumpSecurity(self, output, include_system=False):
-        """Gera <output>/@.security.json (inventário)."""
+        """Gera <output>/@.security.json (inventario)."""
         if not self._check_session():
             return
 
@@ -468,12 +475,9 @@ class Brabo(object):
         include_grants=True,
         include_inventory=True,
     ):
-        """
-        Gera (ou complementa) um Security Metadata Dump compatível com
-        util.dumpInstance().
-
-        Se <output>/@.json já existir, reaproveita os metadados do dump
-        existente em vez de recriá-los.
+        """Gera (ou complementa) um Security Metadata Dump compativel com
+        util.dumpInstance(). Se <output>/@.json ja existir, reaproveita
+        os metadados do dump existente em vez de recria-los.
         """
         if not self._check_session():
             return
@@ -481,7 +485,7 @@ class Brabo(object):
         out = os.path.expanduser(output)
         os.makedirs(out, exist_ok=True)
 
-        # 1. Manifesto — lê ou cria
+        # 1. Manifesto - le ou cria
         manifest = self._read_manifest(out)
         reused = manifest is not None
         if not reused:
@@ -540,16 +544,16 @@ class Brabo(object):
         print("""
 DBA BRABO Extension v{}
 
-Comandos v1.1 — export em arquivo único
+Comandos v1.1 - export em arquivo unico
 ---------------------------------------
 brabo.help()
     Mostra esta ajuda.
 
 brabo.export_grants(...)
-    Exporta CREATE USER, ALTER USER e GRANTs em um único SQL.
+    Exporta CREATE USER, ALTER USER e GRANTs em um unico SQL.
 
-    Parâmetros:
-      user            = "app"          filtra por usuário
+    Parametros:
+      user            = "app"          filtra por usuario
       host            = "%"            filtra por host
       output          = "~/grants.sql" grava em arquivo
       include_create  = True           emite CREATE USER IF NOT EXISTS
@@ -565,25 +569,25 @@ brabo.export_grants(...)
       brabo.export_grants(include_alter=True, output="~/sync.sql")
 
 brabo.roles()
-    Lista roles e seus privilégios.
+    Lista roles e seus privilegios.
 
-Comandos v2.0 — Security Metadata Dump
+Comandos v2.0 - Security Metadata Dump
 --------------------------------------
-Estrutura gerada (compatível com util.dumpInstance):
+Estrutura gerada (compativel com util.dumpInstance):
 
   <output>/
     @.json            manifesto (lido/atualizado)
     @.users.sql       CREATE + ALTER USER
     @.roles.sql       CREATE ROLE + grants de role
     @.grants.sql      GRANTs por conta
-    @.security.json   inventário (contadores + plugins)
+    @.security.json   inventario (contadores + plugins)
 
 brabo.dumpSecurityMetadata(output="/backup/prod", ...)
     Comando principal. Gera tudo de uma vez.
-    Se o diretório já contém @.json, reaproveita os metadados.
+    Se o diretorio ja contem @.json, reaproveita os metadados.
 
-    Parâmetros:
-      output            = "/backup/prod"  diretório destino
+    Parametros:
+      output            = "/backup/prod"  diretorio destino
       include_system    = False           inclui contas de sistema
       include_users     = True
       include_roles     = True
@@ -606,7 +610,7 @@ brabo.grants.diff()
 brabo.security.audit()
 brabo.replication.status()
 brabo.innodb.cluster()
-Migração para a API oficial de extensões do Shell.
+Migracao para a API oficial de extensoes do Shell.
 """.format(__version__))
 
 
