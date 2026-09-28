@@ -11,12 +11,12 @@
 #                                                                     
 # =====================================================================
 #  File     : brabo.py
-#  Version  : 2.0
+#  Version  : 2.2
 #  Author   : Acacio LR
 #  License  : MIT
 #  Repo     : https://github.com/<seu-usuario>/dba-brabo
 #  Requires : MySQL Shell 8.0+ (Python mode)
-#  Tested   : MySQL 8.0.x · 9.4.0
+#  Tested   : MySQL 8.0.x · 8.4.x · 9.4.0
 # =====================================================================
 #
 #  DESCRIPTION
@@ -30,11 +30,26 @@
 #  o manifesto @.json existente quando o diretório já contém um dump
 #  do Shell.
 #
+#  A partir da v2.1, suporta modo REVOKE — gera os comandos de revogação
+#  a partir dos grants existentes, útil para rollback e auditoria.
+#
+#  A partir da v2.2, converte sintaxe proprietária do MariaDB para MySQL
+#  válido (IDENTIFIED VIA → IDENTIFIED WITH, unix_socket/ed25519 removidos,
+#  PASSWORD() convertido), equivalente ao --convert-MariaDB do pt-show-grants.
+#
 #  INSTALLATION
 #  ------------
 #    mkdir -p ~/.mysqlsh/init.d
 #    cp brabo.py ~/.mysqlsh/init.d/brabo.py
 #    # reabra o MySQL Shell
+#
+#  LOAD IN SHELL
+#  ------------
+#    \py
+#    import sys
+#    sys.path.insert(0, "/root/.mysqlsh/init.d")
+#    from brabo import brabo
+#    brabo.help()
 #
 #  QUICK START
 #  -----------
@@ -48,6 +63,16 @@
 #    brabo.export_grants(include_alter=True)             # modo sync
 #    brabo.roles()                                       # lista roles
 #
+#    # --- v2.1 (modo REVOKE) ---
+#    brabo.export_revokes()                              # REVOKE de tudo
+#    brabo.export_revokes(user="app")                    # REVOKE de um user
+#    brabo.export_grants(mode="revoke")                  # idem, via mode=
+#
+#    # --- v2.2 (conversão MariaDB -> MySQL) ---
+#    brabo.export_grants(convert_mariadb=True)           # converte tudo
+#    brabo.export_grants(output="~/mysql.sql", convert_mariadb=True)
+#    brabo.export_revokes(convert_mariadb=True)
+#
 #    # --- v2.0 (Security Metadata Dump) ---
 #    brabo.dumpSecurityMetadata(output="/backup/prod")   # dump completo
 #    brabo.dumpUsers("/backup/prod")                     # só users
@@ -58,8 +83,10 @@
 #  ROADMAP
 #  -------
 #    v1.1  export_grants, roles, help
-#    v2.0  dumpSecurityMetadata + integração com util.dumpInstance()  [current]
-#    v2.1  grants.diff, security.audit
+#    v2.0  dumpSecurityMetadata + integração com util.dumpInstance()
+#    v2.1  export_revokes + mode="revoke"
+#    v2.2  convert_mariadb + filtro mariadb.sys/mariadb.session  [current]
+#    v2.3  grants.diff, security.audit, ordenação determinística
 #    v3.0  official Shell extension API (shell.register_extension)
 #
 # =====================================================================
@@ -68,8 +95,9 @@ from mysqlsh import globals
 import datetime
 import json
 import os
+import re
 
-__version__ = "2.0"
+__version__ = "2.2"
 
 shell = globals.shell
 session = globals.session
@@ -78,6 +106,8 @@ SYSTEM_USERS = (
     "mysql.sys",
     "mysql.session",
     "mysql.infoschema",
+    "mariadb.sys",
+    "mariadb.session",
 )
 
 
@@ -88,6 +118,8 @@ class Brabo(object):
     # Helpers internos
     # -----------------------------------------------------------------
     def _check_session(self):
+        global session
+        session = globals.session  # pega a sessao ATUAL, nao a do import
         if session is None:
             print("[ERRO] Sessao nao conectada.")
             print("       Use \\connect usuario@host antes de rodar a extensao.")
@@ -108,8 +140,6 @@ class Brabo(object):
         is_role=False -> apenas usuarios
         is_role=True  -> apenas roles
         """
-        # Deteccao de role no MySQL 8.0+:
-        #   role = account_locked='Y' AND password_expired='Y' AND authentication_string=''
         role_condition = (
             "account_locked = 'Y' AND password_expired = 'Y' "
             "AND authentication_string = ''"
@@ -155,6 +185,137 @@ class Brabo(object):
         acc = self._quote_account(user, host)
         sql = "SHOW GRANTS FOR {}".format(acc)
         return [r[0] for r in session.run_sql(sql).fetch_all()]
+
+    # -----------------------------------------------------------------
+    # Conversao MariaDB -> MySQL
+    # -----------------------------------------------------------------
+    def _convert_mariadb_to_mysql(self, stmt):
+        """Converte sintaxe proprietaria do MariaDB para MySQL valido.
+
+        Trata:
+          IDENTIFIED VIA plugin USING 'x'          -> IDENTIFIED WITH plugin AS 'x'
+          IDENTIFIED VIA plugin AS 'x'             -> IDENTIFIED WITH plugin AS 'x'
+          IDENTIFIED VIA plugin USING PASSWORD('p')-> IDENTIFIED WITH plugin BY 'p'
+          OR unix_socket / OR ed25519 / OR auth_pam-> removido
+          GRANT ... IDENTIFIED BY PASSWORD 'x'     -> removido (MySQL 8)
+          GRANT ... IDENTIFIED BY 'x'              -> removido (MySQL 8)
+          PASSWORD HISTORY/REUSE/REQUIRE           -> removido
+        """
+        if not stmt:
+            return stmt
+
+        s = stmt
+
+        # 1. IDENTIFIED VIA <plugin> USING PASSWORD('...')
+        s = re.sub(
+            r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+PASSWORD\('([^']*)'\)",
+            r"IDENTIFIED WITH \1 BY '\2'",
+            s, flags=re.IGNORECASE,
+        )
+
+        # 2. IDENTIFIED VIA <plugin> USING <resto>
+        s = re.sub(
+            r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+",
+            r"IDENTIFIED WITH \1 AS ",
+            s, flags=re.IGNORECASE,
+        )
+
+        # 3. IDENTIFIED VIA <plugin> AS <resto>
+        s = re.sub(
+            r"IDENTIFIED\s+VIA\s+(\S+)\s+AS\s+",
+            r"IDENTIFIED WITH \1 AS ",
+            s, flags=re.IGNORECASE,
+        )
+
+        # 4. Remove OR <plugin_inexistente_no_mysql>
+        s = re.sub(
+            r"\s+OR\s+(unix_socket|ed25519|auth_pam|mysql_old_password|pam)\b",
+            "", s, flags=re.IGNORECASE,
+        )
+
+        # 5. GRANT ... IDENTIFIED BY PASSWORD '...' (MariaDB permite, MySQL 8 nao)
+        s = re.sub(
+            r"\s+IDENTIFIED\s+BY\s+PASSWORD\s+'[^']*'",
+            "", s, flags=re.IGNORECASE,
+        )
+
+        # 6. GRANT ... IDENTIFIED BY '...' (idem)
+        s = re.sub(
+            r"\s+IDENTIFIED\s+BY\s+'[^']*'",
+            "", s, flags=re.IGNORECASE,
+        )
+
+        # 7. Remove clausulas MySQL-only (por seguranca, se vierem do dump)
+        s = re.sub(
+            r"\s+PASSWORD\s+HISTORY\s+\S+",
+            "", s, flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r"\s+PASSWORD\s+REUSE\s+INTERVAL\s+\S+",
+            "", s, flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r"\s+PASSWORD\s+REQUIRE\s+CURRENT(\s+\S+)?",
+            "", s, flags=re.IGNORECASE,
+        )
+
+        return s
+
+    # -----------------------------------------------------------------
+    # Conversao GRANT -> REVOKE
+    # -----------------------------------------------------------------
+    def _grant_to_revoke(self, grant):
+        """Converte uma linha de SHOW GRANTS em REVOKE.
+
+        Regras:
+          - GRANT USAGE ON ...      -> ignorado (USAGE eh no-op)
+          - WITH GRANT OPTION       -> removido, gera REVOKE separado
+          - GRANT X ON obj TO user  -> REVOKE X ON obj FROM user
+          - GRANT 'role' TO user    -> REVOKE 'role' FROM user
+          - GRANT PROXY ON x TO y   -> REVOKE PROXY ON x FROM y
+
+        Devolve lista de strings (0, 1 ou 2 statements).
+        """
+        g = grant.strip().rstrip(";").strip()
+        if not g:
+            return []
+
+        g_up = g.upper()
+
+        if g_up.startswith("GRANT USAGE ON"):
+            return []
+
+        had_grant_option = False
+        if " WITH GRANT OPTION" in g_up:
+            idx = g_up.find(" WITH GRANT OPTION")
+            g = g[:idx].rstrip()
+            g_up = g.upper()
+            had_grant_option = True
+
+        if not g_up.startswith("GRANT "):
+            return []
+
+        revoke = "REVOKE " + g[len("GRANT "):]
+
+        idx = revoke.upper().rfind(" TO ")
+        if idx == -1:
+            return []
+        revoke = revoke[:idx] + " FROM " + revoke[idx + 4:] + ";"
+
+        result = [revoke]
+
+        if had_grant_option:
+            r_up = revoke.upper()
+            on_idx = r_up.find(" ON ")
+            from_idx = r_up.rfind(" FROM ")
+            if on_idx != -1 and from_idx != -1 and on_idx < from_idx:
+                obj = revoke[on_idx + 4:from_idx].strip()
+                acc = revoke[from_idx + 6:].rstrip(";").strip()
+                result.append(
+                    "REVOKE GRANT OPTION ON {} FROM {};".format(obj, acc)
+                )
+
+        return result
 
     # -----------------------------------------------------------------
     # Manifesto @.json - compativel com util.dumpInstance()
@@ -252,21 +413,44 @@ class Brabo(object):
         }
 
     # =================================================================
-    # v1.1 - comandos legados
+    # v1.1 - comandos legados (agora com mode e convert_mariadb)
     # =================================================================
     def export_grants(
         self,
         user=None,
         host=None,
         output=None,
+        mode="grant",
+        convert_mariadb=False,
         include_create=True,
         include_alter=False,
         include_grants=True,
         include_system=False,
     ):
-        """Exporta CREATE USER / ALTER USER / GRANTs em arquivo unico."""
+        """Exporta CREATE USER / ALTER USER / GRANTs (ou REVOKEs).
+
+        Parametros:
+          user             -> filtra por nome de usuario
+          host             -> filtra por host
+          output           -> caminho de arquivo (aceita ~)
+          mode             -> "grant" (default) ou "revoke"
+          convert_mariadb  -> converte sintaxe MariaDB -> MySQL
+          include_create   -> emite CREATE USER IF NOT EXISTS
+          include_alter    -> emite ALTER USER (default False)
+          include_grants   -> emite GRANTs/REVOKEs
+          include_system   -> inclui mysql.sys, mysql.session, ...
+        """
         if not self._check_session():
             return
+
+        mode = (mode or "grant").lower()
+        if mode not in ("grant", "revoke"):
+            print("[ERRO] mode invalido: '{}'. Use 'grant' ou 'revoke'.".format(mode))
+            return
+
+        if mode == "revoke":
+            include_create = False
+            include_alter = False
 
         accounts = self._accounts(user, host, include_system=include_system)
 
@@ -281,6 +465,9 @@ class Brabo(object):
         lines.append("-- =========================================================")
         lines.append("-- DBA BRABO - MySQL Shell Extension")
         lines.append("-- Version : {}".format(__version__))
+        lines.append("-- Mode    : {}".format(mode.upper()))
+        if convert_mariadb:
+            lines.append("-- Convert : MariaDB -> MySQL")
         lines.append("-- Server  : {}".format(server))
         lines.append("-- Version : {}".format(version))
         lines.append("-- Date    : {}".format(datetime.datetime.now()))
@@ -297,6 +484,8 @@ class Brabo(object):
             if include_create:
                 try:
                     create, _ = self._user_ddl(usr, hst)
+                    if convert_mariadb:
+                        create = self._convert_mariadb_to_mysql(create)
                     lines.append(create + ";")
                 except Exception as e:
                     lines.append("-- [WARN] CREATE USER falhou para {}: {}".format(account, e))
@@ -304,6 +493,8 @@ class Brabo(object):
             if include_alter:
                 try:
                     _, alter = self._user_ddl(usr, hst)
+                    if convert_mariadb:
+                        alter = self._convert_mariadb_to_mysql(alter)
                     lines.append(alter + ";")
                 except Exception as e:
                     lines.append("-- [WARN] ALTER USER falhou para {}: {}".format(account, e))
@@ -311,7 +502,13 @@ class Brabo(object):
             if include_grants:
                 try:
                     for g in self._user_grants(usr, hst):
-                        lines.append(g + ";")
+                        if convert_mariadb:
+                            g = self._convert_mariadb_to_mysql(g)
+                        if mode == "revoke":
+                            for r in self._grant_to_revoke(g):
+                                lines.append(r)
+                        else:
+                            lines.append(g + ";")
                 except Exception as e:
                     lines.append("-- [WARN] SHOW GRANTS falhou para {}: {}".format(account, e))
 
@@ -326,10 +523,39 @@ class Brabo(object):
                 os.makedirs(parent, exist_ok=True)
             with open(path, "w", encoding="utf8") as f:
                 f.write(text)
-            print("[OK]   {} usuario(s) exportado(s)".format(len(accounts)))
+            print("[OK]   {} usuario(s) exportado(s) [modo={}{}]".format(
+                len(accounts),
+                mode,
+                ", convert_mariadb=True" if convert_mariadb else "",
+            ))
             print("[FILE] {}".format(path))
         else:
             print(text)
+
+    def export_revokes(
+        self,
+        user=None,
+        host=None,
+        output=None,
+        convert_mariadb=False,
+        include_system=False,
+    ):
+        """Atalho para export_grants(mode='revoke').
+
+        Gera os REVOKE correspondentes a todos os grants das contas.
+        Se user= for informado, gera apenas para aquele usuario.
+        """
+        return self.export_grants(
+            user=user,
+            host=host,
+            output=output,
+            mode="revoke",
+            convert_mariadb=convert_mariadb,
+            include_create=False,
+            include_alter=False,
+            include_grants=True,
+            include_system=include_system,
+        )
 
     def roles(self, show_grants=True):
         """Lista roles existentes e, opcionalmente, seus privilegios."""
@@ -485,7 +711,6 @@ class Brabo(object):
         out = os.path.expanduser(output)
         os.makedirs(out, exist_ok=True)
 
-        # 1. Manifesto - le ou cria
         manifest = self._read_manifest(out)
         reused = manifest is not None
         if not reused:
@@ -494,7 +719,6 @@ class Brabo(object):
             print("[INFO] Manifesto existente encontrado em {}/@.json".format(out))
             print("[INFO] Reaproveitando metadados do dump original.")
 
-        # 2. Gera cada parte
         report = {}
         if include_users:
             p, n = self.dumpUsers(out, include_system)
@@ -509,7 +733,6 @@ class Brabo(object):
             p, inv = self.dumpSecurity(out, include_system)
             report["inventory"] = {"file": p, "data": inv}
 
-        # 3. Atualiza manifesto preservando o original
         if "toolsUsed" not in manifest or not isinstance(manifest["toolsUsed"], list):
             manifest["toolsUsed"] = []
         if "dba-brabo" not in manifest["toolsUsed"]:
@@ -521,7 +744,6 @@ class Brabo(object):
         )
         self._update_manifest(manifest, out)
 
-        # 4. Resumo
         print("")
         print("[DBA BRABO] Security Metadata Dump")
         print("  output    : {}".format(out))
@@ -553,13 +775,15 @@ brabo.export_grants(...)
     Exporta CREATE USER, ALTER USER e GRANTs em um unico SQL.
 
     Parametros:
-      user            = "app"          filtra por usuario
-      host            = "%"            filtra por host
-      output          = "~/grants.sql" grava em arquivo
-      include_create  = True           emite CREATE USER IF NOT EXISTS
-      include_alter   = False          emite ALTER USER (sync)
-      include_grants  = True           emite GRANTs
-      include_system  = False          inclui mysql.sys, mysql.session, ...
+      user             = "app"          filtra por usuario
+      host             = "%"            filtra por host
+      output           = "~/grants.sql" grava em arquivo
+      mode             = "grant"        "grant" (default) ou "revoke"
+      convert_mariadb  = False          converte MariaDB -> MySQL
+      include_create   = True           emite CREATE USER IF NOT EXISTS
+      include_alter    = False          emite ALTER USER (sync)
+      include_grants   = True           emite GRANTs/REVOKEs
+      include_system   = False          inclui mysql.sys, mysql.session, ...
 
     Exemplos:
       brabo.export_grants()
@@ -567,6 +791,19 @@ brabo.export_grants(...)
       brabo.export_grants(host="%")
       brabo.export_grants(output="~/backup/grants.sql")
       brabo.export_grants(include_alter=True, output="~/sync.sql")
+      brabo.export_grants(mode="revoke", output="~/revokes.sql")
+      brabo.export_grants(output="~/mysql.sql", convert_mariadb=True)
+
+brabo.export_revokes(user=None, host=None, output=None,
+                     convert_mariadb=False, include_system=False)
+    Atalho para export_grants(mode="revoke").
+    Gera os REVOKE correspondentes a todos os grants das contas.
+    Se user= for informado, gera apenas para aquele usuario.
+
+    Exemplos:
+      brabo.export_revokes(output="~/revokes_all.sql")
+      brabo.export_revokes(user="acaciolr", output="~/revokes_acaciolr.sql")
+      brabo.export_revokes(host="%", output="~/revokes_remote.sql")
 
 brabo.roles()
     Lista roles e seus privilegios.
@@ -600,17 +837,27 @@ brabo.dumpGrants(output, include_system=False)
 brabo.dumpSecurity(output, include_system=False)
     Geram apenas uma parte do dump.
 
-    Exemplo:
-      brabo.dumpSecurityMetadata(output="/backup/prod")
-      brabo.dumpSecurityMetadata(output="/backup/prod", include_system=True)
+Conversao MariaDB -> MySQL
+--------------------------
+O parametro convert_mariadb=True aplica as seguintes conversoes:
 
-Roadmap (v2.1+)
+  IDENTIFIED VIA plugin USING 'x'            -> IDENTIFIED WITH plugin AS 'x'
+  IDENTIFIED VIA plugin USING PASSWORD('p')  -> IDENTIFIED WITH plugin BY 'p'
+  OR unix_socket / OR ed25519 / OR auth_pam  -> removido
+  GRANT ... IDENTIFIED BY PASSWORD 'x'       -> removido (MySQL 8 nao suporta)
+  PASSWORD HISTORY / REUSE / REQUIRE         -> removido
+
+Plugins sem equivalente no MySQL (unix_socket, ed25519) sao sinalizados
+no arquivo gerado. O usuario precisara resetar a senha apos a migracao.
+
+Roadmap (v2.3+)
 ---------------
 brabo.grants.diff()
 brabo.security.audit()
 brabo.replication.status()
 brabo.innodb.cluster()
-Migracao para a API oficial de extensoes do Shell.
+Ordenacao determinística de GRANTs para Git
+Migracao para a API oficial de extensoes do Shell
 """.format(__version__))
 
 
