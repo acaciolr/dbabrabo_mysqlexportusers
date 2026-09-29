@@ -14,7 +14,7 @@
 #  Version  : 2.2
 #  Author   : Acacio LR
 #  License  : MIT
-#  Repo     : https://github.com/<seu-usuario>/dba-brabo
+#  Repo     : https://github.com/acaciolr/dbabrabo_mysqlexportusers
 #  Requires : MySQL Shell 8.0+ (Python mode)
 #  Tested   : MySQL 8.0.x · 8.4.x · 9.4.0
 # =====================================================================
@@ -97,10 +97,7 @@ import json
 import os
 import re
 
-__version__ = "2.2"
-
-shell = globals.shell
-session = globals.session
+__version__ = "2.3"
 
 SYSTEM_USERS = (
     "mysql.sys",
@@ -111,16 +108,47 @@ SYSTEM_USERS = (
 )
 
 
+# ---------------------------------------------------------------------
+# Helpers de sessao (leem globals.session SEMPRE frescos)
+# ---------------------------------------------------------------------
+def _get_session():
+    """Devolve a sessao ATUAL do MySQL Shell, ou None se nao conectado.
+
+    Importante: le globals.session a cada chamada. O autoload do
+    init.d roda ANTES do usuario conectar, entao capturar a sessao
+    no import faria ela ficar presa em None.
+    """
+    try:
+        return globals.session
+    except Exception:
+        return None
+
+
+def _get_shell():
+    try:
+        return globals.shell
+    except Exception:
+        return None
+
+
 class Brabo(object):
     """DBA BRABO - export e dump de metadados de seguranca."""
 
     # -----------------------------------------------------------------
     # Helpers internos
     # -----------------------------------------------------------------
+    @property
+    def session(self):
+        """Sessao atual (sempre fresca)."""
+        return _get_session()
+
+    @property
+    def shell(self):
+        """Shell atual (sempre fresco)."""
+        return _get_shell()
+
     def _check_session(self):
-        global session
-        session = globals.session  # pega a sessao ATUAL, nao a do import
-        if session is None:
+        if self.session is None:
             print("[ERRO] Sessao nao conectada.")
             print("       Use \\connect usuario@host antes de rodar a extensao.")
             return False
@@ -168,13 +196,13 @@ class Brabo(object):
 
         sql += " ORDER BY user, host"
 
-        result = session.run_sql(sql, args)
+        result = self.session.run_sql(sql, args)
         return [(r[0], r[1]) for r in result.fetch_all()]
 
     def _user_ddl(self, user, host):
         """Devolve (create_stmt, alter_stmt) para uma conta."""
         acc = self._quote_account(user, host)
-        row = session.run_sql("SHOW CREATE USER {}".format(acc)).fetch_one()
+        row = self.session.run_sql("SHOW CREATE USER {}".format(acc)).fetch_one()
         create = row[0]
         if create.upper().startswith("CREATE USER"):
             create = "CREATE USER IF NOT EXISTS" + create[len("CREATE USER"):]
@@ -184,68 +212,45 @@ class Brabo(object):
     def _user_grants(self, user, host):
         acc = self._quote_account(user, host)
         sql = "SHOW GRANTS FOR {}".format(acc)
-        return [r[0] for r in session.run_sql(sql).fetch_all()]
+        return [r[0] for r in self.session.run_sql(sql).fetch_all()]
 
     # -----------------------------------------------------------------
     # Conversao MariaDB -> MySQL
     # -----------------------------------------------------------------
     def _convert_mariadb_to_mysql(self, stmt):
-        """Converte sintaxe proprietaria do MariaDB para MySQL valido.
-
-        Trata:
-          IDENTIFIED VIA plugin USING 'x'          -> IDENTIFIED WITH plugin AS 'x'
-          IDENTIFIED VIA plugin AS 'x'             -> IDENTIFIED WITH plugin AS 'x'
-          IDENTIFIED VIA plugin USING PASSWORD('p')-> IDENTIFIED WITH plugin BY 'p'
-          OR unix_socket / OR ed25519 / OR auth_pam-> removido
-          GRANT ... IDENTIFIED BY PASSWORD 'x'     -> removido (MySQL 8)
-          GRANT ... IDENTIFIED BY 'x'              -> removido (MySQL 8)
-          PASSWORD HISTORY/REUSE/REQUIRE           -> removido
-        """
+        """Converte sintaxe proprietaria do MariaDB para MySQL valido."""
         if not stmt:
             return stmt
 
         s = stmt
 
-        # 1. IDENTIFIED VIA <plugin> USING PASSWORD('...')
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+PASSWORD\('([^']*)'\)",
             r"IDENTIFIED WITH \1 BY '\2'",
             s, flags=re.IGNORECASE,
         )
-
-        # 2. IDENTIFIED VIA <plugin> USING <resto>
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+",
             r"IDENTIFIED WITH \1 AS ",
             s, flags=re.IGNORECASE,
         )
-
-        # 3. IDENTIFIED VIA <plugin> AS <resto>
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+AS\s+",
             r"IDENTIFIED WITH \1 AS ",
             s, flags=re.IGNORECASE,
         )
-
-        # 4. Remove OR <plugin_inexistente_no_mysql>
         s = re.sub(
             r"\s+OR\s+(unix_socket|ed25519|auth_pam|mysql_old_password|pam)\b",
             "", s, flags=re.IGNORECASE,
         )
-
-        # 5. GRANT ... IDENTIFIED BY PASSWORD '...' (MariaDB permite, MySQL 8 nao)
         s = re.sub(
             r"\s+IDENTIFIED\s+BY\s+PASSWORD\s+'[^']*'",
             "", s, flags=re.IGNORECASE,
         )
-
-        # 6. GRANT ... IDENTIFIED BY '...' (idem)
         s = re.sub(
             r"\s+IDENTIFIED\s+BY\s+'[^']*'",
             "", s, flags=re.IGNORECASE,
         )
-
-        # 7. Remove clausulas MySQL-only (por seguranca, se vierem do dump)
         s = re.sub(
             r"\s+PASSWORD\s+HISTORY\s+\S+",
             "", s, flags=re.IGNORECASE,
@@ -265,17 +270,7 @@ class Brabo(object):
     # Conversao GRANT -> REVOKE
     # -----------------------------------------------------------------
     def _grant_to_revoke(self, grant):
-        """Converte uma linha de SHOW GRANTS em REVOKE.
-
-        Regras:
-          - GRANT USAGE ON ...      -> ignorado (USAGE eh no-op)
-          - WITH GRANT OPTION       -> removido, gera REVOKE separado
-          - GRANT X ON obj TO user  -> REVOKE X ON obj FROM user
-          - GRANT 'role' TO user    -> REVOKE 'role' FROM user
-          - GRANT PROXY ON x TO y   -> REVOKE PROXY ON x FROM y
-
-        Devolve lista de strings (0, 1 ou 2 statements).
-        """
+        """Converte uma linha de SHOW GRANTS em REVOKE."""
         g = grant.strip().rstrip(";").strip()
         if not g:
             return []
@@ -332,10 +327,9 @@ class Brabo(object):
             print("[WARN] Falha ao ler {}: {}".format(path, e))
             return None
 
-    @staticmethod
-    def _supports_gtid():
+    def _supports_gtid(self):
         try:
-            row = session.run_sql("SELECT @@gtid_mode").fetch_one()
+            row = self.session.run_sql("SELECT @@gtid_mode").fetch_one()
             return bool(row) and row[0] in ("ON", "OFF_PERMISSIVE", "ON_PERMISSIVE")
         except Exception:
             return False
@@ -343,13 +337,17 @@ class Brabo(object):
     def _build_manifest(self):
         """Cria manifesto novo no formato do util.dumpInstance()."""
         try:
-            host = session.run_sql("SELECT @@hostname").fetch_one()[0]
-            vers = session.run_sql("SELECT @@version").fetch_one()[0]
-            charset = session.run_sql("SELECT @@character_set_server").fetch_one()[0]
+            host = self.session.run_sql("SELECT @@hostname").fetch_one()[0]
+            vers = self.session.run_sql("SELECT @@version").fetch_one()[0]
+            charset = self.session.run_sql(
+                "SELECT @@character_set_server"
+            ).fetch_one()[0]
             gtid = ""
             if self._supports_gtid():
                 try:
-                    gtid = session.run_sql("SELECT @@gtid_executed").fetch_one()[0] or ""
+                    gtid = self.session.run_sql(
+                        "SELECT @@gtid_executed"
+                    ).fetch_one()[0] or ""
                 except Exception:
                     gtid = ""
         except Exception:
@@ -387,7 +385,7 @@ class Brabo(object):
 
         for usr, hst in users:
             try:
-                row = session.run_sql(
+                row = self.session.run_sql(
                     "SELECT plugin, account_locked, ssl_type "
                     "FROM mysql.user WHERE user=? AND host=?",
                     [usr, hst],
@@ -413,7 +411,7 @@ class Brabo(object):
         }
 
     # =================================================================
-    # v1.1 - comandos legados (agora com mode e convert_mariadb)
+    # v1.1 - export em arquivo unico
     # =================================================================
     def export_grants(
         self,
@@ -427,19 +425,7 @@ class Brabo(object):
         include_grants=True,
         include_system=False,
     ):
-        """Exporta CREATE USER / ALTER USER / GRANTs (ou REVOKEs).
-
-        Parametros:
-          user             -> filtra por nome de usuario
-          host             -> filtra por host
-          output           -> caminho de arquivo (aceita ~)
-          mode             -> "grant" (default) ou "revoke"
-          convert_mariadb  -> converte sintaxe MariaDB -> MySQL
-          include_create   -> emite CREATE USER IF NOT EXISTS
-          include_alter    -> emite ALTER USER (default False)
-          include_grants   -> emite GRANTs/REVOKEs
-          include_system   -> inclui mysql.sys, mysql.session, ...
-        """
+        """Exporta CREATE USER / ALTER USER / GRANTs (ou REVOKEs)."""
         if not self._check_session():
             return
 
@@ -458,8 +444,8 @@ class Brabo(object):
             print("Nenhum usuario encontrado com os filtros informados.")
             return
 
-        server = session.run_sql("SELECT @@hostname").fetch_one()[0]
-        version = session.run_sql("SELECT @@version").fetch_one()[0]
+        server = self.session.run_sql("SELECT @@hostname").fetch_one()[0]
+        version = self.session.run_sql("SELECT @@version").fetch_one()[0]
 
         lines = []
         lines.append("-- =========================================================")
@@ -540,11 +526,7 @@ class Brabo(object):
         convert_mariadb=False,
         include_system=False,
     ):
-        """Atalho para export_grants(mode='revoke').
-
-        Gera os REVOKE correspondentes a todos os grants das contas.
-        Se user= for informado, gera apenas para aquele usuario.
-        """
+        """Atalho para export_grants(mode='revoke')."""
         return self.export_grants(
             user=user,
             host=host,
@@ -702,8 +684,7 @@ class Brabo(object):
         include_inventory=True,
     ):
         """Gera (ou complementa) um Security Metadata Dump compativel com
-        util.dumpInstance(). Se <output>/@.json ja existir, reaproveita
-        os metadados do dump existente em vez de recria-los.
+        util.dumpInstance().
         """
         if not self._check_session():
             return
@@ -798,7 +779,6 @@ brabo.export_revokes(user=None, host=None, output=None,
                      convert_mariadb=False, include_system=False)
     Atalho para export_grants(mode="revoke").
     Gera os REVOKE correspondentes a todos os grants das contas.
-    Se user= for informado, gera apenas para aquele usuario.
 
     Exemplos:
       brabo.export_revokes(output="~/revokes_all.sql")
@@ -850,21 +830,31 @@ O parametro convert_mariadb=True aplica as seguintes conversoes:
 Plugins sem equivalente no MySQL (unix_socket, ed25519) sao sinalizados
 no arquivo gerado. O usuario precisara resetar a senha apos a migracao.
 
-Roadmap (v2.3+)
+Roadmap (v2.4+)
 ---------------
 brabo.grants.diff()
 brabo.security.audit()
 brabo.replication.status()
 brabo.innodb.cluster()
-Ordenacao determinística de GRANTs para Git
+Ordenacao deterministica de GRANTs para Git
 Migracao para a API oficial de extensoes do Shell
 """.format(__version__))
 
-
 # ---------------------------------------------------------------------
-# Registro global
+# Autoload robusto
 # ---------------------------------------------------------------------
+# Cria a instancia SEMPRE, independente do contexto.
 brabo = Brabo()
-globals.brabo = brabo
 
-print("DBA BRABO extension v{} loaded. Type brabo.help() for usage.".format(__version__))
+# Registra em globals.brabo (usado quando o Shell carrega via init.d).
+try:
+    globals.brabo = brabo
+    _registered = True
+except Exception:
+    _registered = False
+
+# Mensagem de carregamento (sempre visivel, ajuda no diagnostico).
+if _registered:
+    print("DBA BRABO extension v{} loaded. Type brabo.help() for usage.".format(__version__))
+else:
+    print("DBA BRABO extension v{} loaded (import direto). Use from brabo import brabo.".format(__version__))
