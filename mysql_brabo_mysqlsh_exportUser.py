@@ -11,7 +11,7 @@
 #                                                                     
 # =====================================================================
 #  File     : brabo.py
-#  Version  : 2.2
+#  Version  : 2.3.1
 #  Author   : Acacio LR
 #  License  : MIT
 #  Repo     : https://github.com/acaciolr/dbabrabo_mysqlexportusers
@@ -97,7 +97,16 @@ import json
 import os
 import re
 
-__version__ = "2.3"
+__version__ = "2.3.1"
+
+# Plugins do MariaDB sem equivalente no MySQL (v2.3.1)
+MARIADB_ONLY_PLUGINS = (
+    "unix_socket",
+    "ed25519",
+    "auth_pam",
+    "pam",
+    "mysql_old_password",
+)
 
 SYSTEM_USERS = (
     "mysql.sys",
@@ -199,14 +208,44 @@ class Brabo(object):
         result = self.session.run_sql(sql, args)
         return [(r[0], r[1]) for r in result.fetch_all()]
 
+    def _current_account(self):
+        """Conta com a qual a sessao esta conectada, como (user, host)."""
+        try:
+            cur = self.session.run_sql("SELECT CURRENT_USER()").fetch_one()[0]
+            u, _, h = cur.rpartition("@")
+            return (u, h)
+        except Exception:
+            return None
+
+    def _has_credential(self, user, host):
+        """True se a conta tem hash de autenticacao gravado (v2.3.1)."""
+        try:
+            row = self.session.run_sql(
+                "SELECT authentication_string FROM mysql.user "
+                "WHERE user=? AND host=?",
+                [user, host],
+            ).fetch_one()
+            return bool(row and row[0])
+        except Exception:
+            return True
+
     def _user_ddl(self, user, host):
-        """Devolve (create_stmt, alter_stmt) para uma conta."""
+        """Devolve (create_stmt, alter_stmt) para uma conta.
+
+        v2.3.1: alter_stmt vem None quando reaplicar o ALTER USER seria
+        perigoso: (a) conta sem hash gravado, pois o SHOW CREATE USER nao
+        traz AS '<hash>' e o ALTER zera a credencial e EXPIRA a senha
+        (visto no root@localhost); (b) a conta da propria sessao.
+        """
         acc = self._quote_account(user, host)
         row = self.session.run_sql("SHOW CREATE USER {}".format(acc)).fetch_one()
         create = row[0]
         if create.upper().startswith("CREATE USER"):
             create = "CREATE USER IF NOT EXISTS" + create[len("CREATE USER"):]
         alter = create.replace("CREATE USER IF NOT EXISTS", "ALTER USER", 1)
+        if not self._has_credential(user, host) or \
+                self._current_account() == (user, host):
+            alter = None
         return create, alter
 
     def _user_grants(self, user, host):
@@ -223,6 +262,21 @@ class Brabo(object):
             return stmt
 
         s = stmt
+
+        # 0. IDENTIFIED VIA a OR b [OR c] ... (v2.3.1): mantem o primeiro
+        #    plugin que existe no MySQL e descarta os demais.
+        m = re.search(
+            r"IDENTIFIED\s+VIA\s+(\w+(?:\s+OR\s+\w+)+)",
+            s, flags=re.IGNORECASE,
+        )
+        if m:
+            plugins = re.split(r"\s+OR\s+", m.group(1), flags=re.IGNORECASE)
+            keep = [p for p in plugins
+                    if p.lower() not in MARIADB_ONLY_PLUGINS]
+            if keep:
+                s = s[:m.start(1)] + keep[0] + s[m.end(1):]
+            else:
+                s = s[:m.start()] + s[m.end():]
 
         s = re.sub(
             r"IDENTIFIED\s+VIA\s+(\S+)\s+USING\s+PASSWORD\('([^']*)'\)",
@@ -265,6 +319,15 @@ class Brabo(object):
         )
 
         return s
+
+    @staticmethod
+    def _mariadb_warnings(stmt):
+        """Avisos para plugins sem equivalente no MySQL (v2.3.1)."""
+        found = []
+        for p in MARIADB_ONLY_PLUGINS:
+            if re.search(r"\b" + p + r"\b", stmt or "", flags=re.IGNORECASE):
+                found.append(p)
+        return found
 
     # -----------------------------------------------------------------
     # Conversao GRANT -> REVOKE
@@ -471,7 +534,13 @@ class Brabo(object):
                 try:
                     create, _ = self._user_ddl(usr, hst)
                     if convert_mariadb:
+                        warn = self._mariadb_warnings(create)
                         create = self._convert_mariadb_to_mysql(create)
+                        for p in warn:
+                            lines.append(
+                                "-- [WARN] plugin '{}' sem equivalente no MySQL "
+                                "foi removido: defina uma senha para {}".format(
+                                    p, account))
                     lines.append(create + ";")
                 except Exception as e:
                     lines.append("-- [WARN] CREATE USER falhou para {}: {}".format(account, e))
@@ -479,9 +548,14 @@ class Brabo(object):
             if include_alter:
                 try:
                     _, alter = self._user_ddl(usr, hst)
-                    if convert_mariadb:
-                        alter = self._convert_mariadb_to_mysql(alter)
-                    lines.append(alter + ";")
+                    if alter is None:
+                        lines.append(
+                            "-- [SKIP] ALTER USER omitido para {} (conta sem hash "
+                            "ou conta da sessao atual)".format(account))
+                    else:
+                        if convert_mariadb:
+                            alter = self._convert_mariadb_to_mysql(alter)
+                        lines.append(alter + ";")
                 except Exception as e:
                     lines.append("-- [WARN] ALTER USER falhou para {}: {}".format(account, e))
 
@@ -586,7 +660,12 @@ class Brabo(object):
             try:
                 create, alter = self._user_ddl(usr, hst)
                 lines.append(create + ";")
-                lines.append(alter + ";")
+                if alter is None:
+                    lines.append(
+                        "-- [SKIP] ALTER USER omitido para {} (conta sem hash "
+                        "ou conta da sessao atual)".format(acc))
+                else:
+                    lines.append(alter + ";")
             except Exception as e:
                 lines.append("-- [WARN] {}: {}".format(acc, e))
             lines.append("")
