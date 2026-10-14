@@ -15,7 +15,7 @@
 > **MariaDB → MySQL** — sem dependências externas, pronto para Git, seguro
 > para replay entre ambientes (dev → staging → prod).
 
-[![Version](https://img.shields.io/badge/version-2.2-blueviolet)](#changelog)
+[![Version](https://img.shields.io/badge/version-2.3.2-blueviolet)](#changelog)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MySQL Shell](https://img.shields.io/badge/MySQL%20Shell-8.0%2B-blue)](#compatibilidade)
 [![MySQL](https://img.shields.io/badge/MySQL-8.0%20%7C%208.4%20%7C%209.4-orange)](#compatibilidade)
